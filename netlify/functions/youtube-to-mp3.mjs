@@ -1,6 +1,10 @@
-import { Innertube } from 'youtubei.js';
+import { Innertube, Platform } from 'youtubei.js/web';
 import { spawn } from 'node:child_process';
 import ffmpegPath from 'ffmpeg-static';
+
+// YouTube.js requires a JavaScript interpreter for deciphering streaming URLs.
+// Node.js can safely provide one for this server-side function.
+Platform.shim.eval = async (data) => new Function(data.output)();
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -44,8 +48,50 @@ async function readProcessError(proc) {
   return Buffer.concat(chunks).toString('utf8').trim();
 }
 
+async function getAudioFormat(id) {
+  // WEB is the normal client. If YouTube does not expose streaming data to it,
+  // try Android as a second supported InnerTube client.
+  const clients = ['WEB', 'ANDROID'];
+  const errors = [];
+
+  for (const clientType of clients) {
+    try {
+      const yt = await Innertube.create({
+        client_type: clientType,
+        retrieve_player: true,
+        po_token: process.env.YOUTUBE_PO_TOKEN || undefined
+      });
+
+      const info = await yt.getBasicInfo(id);
+      const format = info.chooseFormat({
+        type: 'audio',
+        quality: 'best'
+      });
+
+      if (!format) {
+        errors.push(`${clientType}: audio format not found`);
+        continue;
+      }
+
+      const streamUrl = format.url || await format.decipher(yt.session.player);
+      if (!streamUrl) {
+        errors.push(`${clientType}: stream URL not available`);
+        continue;
+      }
+
+      return { yt, info, format, streamUrl };
+    } catch (error) {
+      errors.push(`${clientType}: ${error?.message || String(error)}`);
+    }
+  }
+
+  const detail = errors.join(' | ');
+  const error = new Error(detail || 'Streaming data not available');
+  error.code = 'NO_STREAM';
+  throw error;
+}
+
 export default async (req) => {
-  // Simple health check so the deployed Function can be tested directly.
   if (req.method === 'GET') {
     return json({ ok: true, function: 'youtube-to-mp3' });
   }
@@ -71,33 +117,9 @@ export default async (req) => {
       return json({ error: '서버에서 FFmpeg를 찾지 못했어요.' }, 500);
     }
 
-    const yt = await Innertube.create();
-    const info = await yt.getBasicInfo(id);
+    const { info, streamUrl } = await getAudioFormat(id);
+    const title = safeName(info.basic_info?.title || `YouTube-${id}`);
 
-    const title = safeName(
-      info.basic_info?.title || `YouTube-${id}`
-    );
-
-    // youtubei.js provides a deciphered streaming format. Using the
-    // library's streaming helper avoids manually handling player state.
-    const format = await yt.getStreamingData(id, {
-      type: 'audio',
-      quality: 'best'
-    });
-
-    if (!format) {
-      return json({ error: '오디오 스트림을 찾지 못했어요.' }, 404);
-    }
-
-    const streamUrl =
-      format.url || await format.decipher(yt.session.player);
-
-    if (!streamUrl) {
-      return json({ error: '오디오 스트림 주소를 얻지 못했어요.' }, 502);
-    }
-
-    // YouTube media endpoints can reject a request without a browser-like
-    // User-Agent / Referer.
     const upstream = await fetch(streamUrl, {
       redirect: 'follow',
       headers: {
@@ -114,9 +136,6 @@ export default async (req) => {
       );
     }
 
-    // IMPORTANT: child_process.spawn(command, args, options)
-    // The previous package passed { args: [...] } as the second argument,
-    // which prevents FFmpeg from starting correctly in Node.
     const ff = spawn(
       ffmpegPath,
       [
@@ -203,7 +222,7 @@ export default async (req) => {
     console.error('youtube-to-mp3 error:', e);
     return json({
       error: e?.message
-        ? `YouTube 변환에 실패했어요: ${String(e.message).slice(0, 300)}`
+        ? `YouTube 변환에 실패했어요: ${String(e.message).slice(0, 500)}`
         : 'YouTube 변환에 실패했어요.'
     }, 500);
   }
