@@ -1,0 +1,10 @@
+{
+  "name": "muse-youtube-import",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=20"},
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "youtubei.js": "^18.1.0"
+  }
+}
